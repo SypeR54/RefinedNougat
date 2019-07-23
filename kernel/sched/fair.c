@@ -1231,9 +1231,9 @@ struct hmp_global_attr {
 };
 
 #ifdef CONFIG_HMP_FREQUENCY_INVARIANT_SCALE
-#define HMP_DATA_SYSFS_MAX 14
+#define HMP_DATA_SYSFS_MAX 17
 #else
-#define HMP_DATA_SYSFS_MAX 13
+#define HMP_DATA_SYSFS_MAX 16
 #endif
 
 struct hmp_data_struct {
@@ -3822,16 +3822,30 @@ static struct sched_entity *hmp_get_lightest_task(struct sched_entity* se, int m
  * hmp_up_prio: Only up migrate task with high priority (<hmp_up_prio)
  * hmp_next_up_threshold: Delay before next up migration (1024 ~= 1 ms)
  * hmp_next_down_threshold: Delay before next down migration (1024 ~= 1 ms)
+ *
+ * Small Task Packing:
+ * We can choose to fill the littlest CPUs in an HMP system rather than
+ * the typical spreading mechanic. This behavior is controllable using
+ * two variables.
+ * hmp_packing_enabled: runtime control over pack/spread
+ * hmp_full_threshold: Consider a CPU with this much unweighted load full
  */
 static int hmp_boostpulse_duration = 1000000; /* microseconds */
 static u64 hmp_boostpulse_endtime;
 static int hmp_boost_val;
+#ifdef CONFIG_SCHED_HMP_LITTLE_PACKING
+static int hmp_packing_enable_val;
+#endif
 static int hmp_semiboost_val;
 static int hmp_boostpulse;
 static int hmp_active_down_migration;
 static int hmp_aggressive_up_migration;
 static int hmp_aggressive_yield;
+static int hmp_fork_migrate_big = 0;
 static DEFINE_RAW_SPINLOCK(hmp_boost_lock);
+#ifdef CONFIG_SCHED_HMP_LITTLE_PACKING
+static DEFINE_RAW_SPINLOCK(hmp_packing_enable_lock);
+#endif
 static DEFINE_RAW_SPINLOCK(hmp_semiboost_lock);
 static DEFINE_RAW_SPINLOCK(hmp_sysfs_lock);
 
@@ -3843,6 +3857,21 @@ unsigned int hmp_up_prio = NICE_TO_PRIO(CONFIG_SCHED_HMP_PRIO_FILTER_VAL);
 #endif
 unsigned int hmp_next_up_threshold = 4096;
 unsigned int hmp_next_down_threshold = 4096;
+
+#ifdef CONFIG_SCHED_HMP_LITTLE_PACKING
+unsigned int hmp_packing_enabled = 1;
+#ifdef CONFIG_SOC_EXYNOS5433
+unsigned int hmp_full_threshold = 575; /* Exynos 5433 has overdrive bend at 900MHz */
+#else
+#ifndef CONFIG_ARCH_VEXPRESS_TC2
+unsigned int hmp_full_threshold = (NICE_0_LOAD * 9) / 8;
+#else
+/* TC2 has a sharp consumption curve @ around 800Mhz, so
+   we aim to spread the load around that frequency. */
+unsigned int hmp_full_threshold = 650;  /*  80% of the 800Mhz freq * NICE_0_LOAD */
+#endif
+#endif
+#endif
 
 static inline int hmp_boost(void)
 {
@@ -3860,6 +3889,24 @@ static inline int hmp_boost(void)
 	return ret;
 }
 
+#ifdef CONFIG_SCHED_HMP_LITTLE_PACKING
+static inline int hmp_packing_enable(void)
+{
+	u64 now = ktime_to_us(ktime_get());
+	int ret;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&hmp_packing_enable_lock, flags);
+	if (hmp_packing_enable_val)
+		ret = 1;
+	else
+		ret = 0;
+	raw_spin_unlock_irqrestore(&hmp_packing_enable_lock, flags);
+
+	return ret;
+}
+#endif
+
 static inline int hmp_semiboost(void)
 {
 	if (hmp_semiboost_val)
@@ -3871,6 +3918,11 @@ static unsigned int hmp_up_migration(int cpu, int *target_cpu, struct sched_enti
 static unsigned int hmp_down_migration(int cpu, struct sched_entity *se);
 static inline unsigned int hmp_domain_min_load(struct hmp_domain *hmpd,
 						int *min_cpu, struct cpumask *affinity);
+
+static inline struct hmp_domain *hmp_smallest_domain(void)
+{
+	return list_entry(hmp_domains.prev, struct hmp_domain, hmp_domains);
+}
 
 /* Check if cpu is in fastest hmp_domain */
 static inline unsigned int hmp_cpu_is_fastest(int cpu)
@@ -3949,7 +4001,49 @@ static inline unsigned int hmp_select_slower_cpu(struct task_struct *tsk,
 
 	return lowest_cpu;
 }
+#ifdef CONFIG_SCHED_HMP_LITTLE_PACKING
+/*
+ * Select the 'best' candidate little CPU to wake up on.
+ * Implements a packing strategy which examines CPU in
+ * logical CPU order, and selects the first which will
+ * have at least 10% capacity available, according to
+ * both tracked load of the runqueue and the task.
+ */
+static inline unsigned int hmp_best_little_cpu(struct task_struct *tsk,
+		int cpu) {
+	int tmp_cpu;
+	unsigned long estimated_load;
+	struct hmp_domain *hmp;
+	struct sched_avg *avg;
+	struct cpumask allowed_hmp_cpus;
 
+	if(!hmp_packing_enable() ||
+			tsk->se.avg.load_avg_ratio > ((NICE_0_LOAD * 90)/100))
+		return hmp_select_slower_cpu(tsk, cpu);
+
+	if (hmp_cpu_is_slowest(cpu))
+		hmp = hmp_cpu_domain(cpu);
+	else
+		hmp = hmp_slower_domain(cpu);
+
+	/* respect affinity */
+	cpumask_and(&allowed_hmp_cpus, &hmp->cpus,
+			tsk_cpus_allowed(tsk));
+
+	for_each_cpu_mask(tmp_cpu, allowed_hmp_cpus) {
+		avg = &cpu_rq(tmp_cpu)->avg;
+		/* estimate new rq load if we add this task */
+		estimated_load = avg->load_avg_ratio +
+				tsk->se.avg.load_avg_ratio;
+		if (estimated_load <= hmp_full_threshold) {
+			cpu = tmp_cpu;
+			break;
+		}
+	}
+	/* if no match was found, the task uses the initial value */
+	return cpu;
+}
+#endif
 static inline void hmp_next_up_delay(struct sched_entity *se, int cpu)
 {
 	/* hack - always use clock from first online CPU */
@@ -4160,6 +4254,28 @@ static int hmp_boost_from_sysfs(int value)
 	return ret;
 }
 
+#ifdef CONFIG_SCHED_HMP_LITTLE_PACKING
+static int hmp_packing_enable_from_sysfs(int value)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	raw_spin_lock_irqsave(&hmp_packing_enable_lock, flags);
+	if (value == 1)
+		hmp_packing_enable_val++;
+	else if (value == 0)
+		if (hmp_packing_enable_val >= 1)
+			hmp_packing_enable_val--;
+		else
+			ret = -EINVAL;
+	else
+		ret = -EINVAL;
+	raw_spin_unlock_irqrestore(&hmp_packing_enable_lock, flags);
+
+	return ret;
+}
+#endif
+
 static int hmp_semiboost_from_sysfs(int value)
 {
 	unsigned long flags;
@@ -4240,10 +4356,37 @@ static int hmp_aggressive_yield_from_sysfs(int value)
 	return ret;
 }
 
+static int hmp_fork_migrate_big_from_sysfs(int value)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	raw_spin_lock_irqsave(&hmp_sysfs_lock, flags);
+	if (value == 1)
+		hmp_fork_migrate_big++;
+	else if (value == 0)
+		if (hmp_fork_migrate_big >= 1)
+			hmp_fork_migrate_big--;
+		else
+			ret = -EINVAL;
+	else
+		ret = -EINVAL;
+	raw_spin_unlock_irqrestore(&hmp_sysfs_lock, flags);
+
+	return ret;
+}
+
 int set_hmp_boost(int enable)
 {
 	return hmp_boost_from_sysfs(enable);
 }
+
+#ifdef CONFIG_SCHED_HMP_LITTLE_PACKING
+int set_hmp_packing_enable(int enable)
+{
+	return hmp_packing_enable_from_sysfs(enable);
+}
+#endif
 
 int set_hmp_semiboost(int enable)
 {
@@ -4283,10 +4426,22 @@ int set_hmp_aggressive_yield(int enable)
 	return hmp_aggressive_yield_from_sysfs(enable);
 }
 
+int set_hmp_fork_migrate_big(int enable)
+{
+	return hmp_fork_migrate_big_from_sysfs(enable);
+}
+
 int get_hmp_boost(void)
 {
 	return hmp_boost();
 }
+
+#ifdef CONFIG_SCHED_HMP_LITTLE_PACKING
+int get_hmp_packing_enable(void)
+{
+	return hmp_packing_enable();
+}
+#endif
 
 int get_hmp_semiboost(void)
 {
@@ -4308,6 +4463,15 @@ int set_hmp_down_threshold(int value)
 static int hmp_freqinvar_from_sysfs(int value)
 {
 	if (value < 0 || value > 1)
+		return -1;
+	return value;
+}
+#endif
+#ifdef CONFIG_SCHED_HMP_LITTLE_PACKING
+/* packing value must be non-negative */
+static int hmp_packing_from_sysfs(int value)
+{
+	if (value < 0)
 		return -1;
 	return value;
 }
@@ -4397,6 +4561,11 @@ static int hmp_attr_init(void)
 		NULL,
 		hmp_aggressive_yield_from_sysfs);
 
+	hmp_attr_add("fork_migrate_big",
+		&hmp_fork_migrate_big,
+		NULL,
+		hmp_fork_migrate_big_from_sysfs);
+
 #ifdef CONFIG_HMP_FREQUENCY_INVARIANT_SCALE
 	/* default frequency-invariant scaling ON */
 	hmp_data.freqinvar_load_scale_enabled = 1;
@@ -4404,6 +4573,16 @@ static int hmp_attr_init(void)
 		&hmp_data.freqinvar_load_scale_enabled,
 		NULL,
 		hmp_freqinvar_from_sysfs);
+#endif
+#ifdef CONFIG_SCHED_HMP_LITTLE_PACKING
+	hmp_attr_add("packing_enable",
+		&hmp_packing_enable_val,
+		NULL,
+		hmp_packing_enable_from_sysfs);
+	hmp_attr_add("packing_limit",
+		&hmp_full_threshold,
+		NULL,
+		hmp_packing_from_sysfs);
 #endif
 	hmp_data.attr_group.name = "hmp";
 	hmp_data.attr_group.attrs = hmp_data.attributes;
@@ -4443,11 +4622,10 @@ static inline unsigned int hmp_domain_min_load(struct hmp_domain *hmpd,
 	struct cpumask temp_cpumask;
 	/*
 	 * only look at CPUs allowed if specified,
-	 * always consider online CPUs in the right HMP domain
+	 * otherwise look at all online CPUs in the
+	 * right HMP domain
 	 */
-	cpumask_and(&temp_cpumask, &hmpd->cpus, cpu_online_mask);
-	if (affinity)
-		cpumask_and(&temp_cpumask, &temp_cpumask, affinity);
+	cpumask_and(&temp_cpumask, &hmpd->cpus, affinity ? affinity : cpu_online_mask);
 
 	for_each_cpu_mask(cpu, temp_cpumask) {
 		avg = &cpu_rq(cpu)->avg;
@@ -4560,6 +4738,19 @@ select_task_rq_fair(struct task_struct *p, int sd_flag, int wake_flags)
 	if (p->nr_cpus_allowed == 1)
 		return prev_cpu;
 
+#ifdef CONFIG_SCHED_HMP
+	/* always put non-kernel forking tasks on a big domain */
+	if (hmp_fork_migrate_big && unlikely(sd_flag & SD_BALANCE_FORK) && hmp_task_should_forkboost(p)) {
+		new_cpu = hmp_select_faster_cpu(p, prev_cpu);
+		if (new_cpu != NR_CPUS) {
+			hmp_next_up_delay(&p->se, new_cpu);
+			return new_cpu;
+		}
+		/* failed to perform HMP fork balance, use normal balance */
+		new_cpu = cpu;
+	}
+#endif
+
 	if (sd_flag & SD_BALANCE_WAKE) {
 		if (cpumask_test_cpu(cpu, tsk_cpus_allowed(p)))
 			want_affine = 1;
@@ -4643,10 +4834,16 @@ unlock:
 		return new_cpu;
 	}
 	if (hmp_down_migration(prev_cpu, &p->se)) {
+#ifdef CONFIG_SCHED_HMP_LITTLE_PACKING
+		new_cpu = hmp_best_little_cpu(p, prev_cpu);
+#else
 		new_cpu = hmp_select_slower_cpu(p, prev_cpu);
-		hmp_next_down_delay(&p->se, new_cpu);
-		trace_sched_hmp_migrate(p, new_cpu, HMP_MIGRATE_WAKEUP);
-		return new_cpu;
+#endif
+		if (new_cpu != prev_cpu) {
+			hmp_next_down_delay(&p->se, new_cpu);
+			trace_sched_hmp_migrate(p, new_cpu, HMP_MIGRATE_WAKEUP);
+			return new_cpu;
+		}
 	}
 	/* Make sure that the task stays in its previous hmp domain */
 	if (!cpumask_test_cpu(new_cpu, &hmp_cpu_domain(task_cpu(p))->cpus))
@@ -5700,7 +5897,8 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 {
 	unsigned long nr_running, max_nr_running, min_nr_running;
 	unsigned long load, max_cpu_load, min_cpu_load;
-	unsigned int balance_cpu = -1, first_idle_cpu = 0;
+	unsigned int balance_cpu = -1;
+	unsigned long balance_load = ~0UL;
 	unsigned long avg_load_per_task = 0;
 	int i;
 
@@ -5720,13 +5918,12 @@ static inline void update_sg_lb_stats(struct lb_env *env,
 
 		/* Bias balancing toward cpus of our domain */
 		if (local_group) {
-			if (idle_cpu(i) && !first_idle_cpu &&
-					cpumask_test_cpu(i, sched_group_mask(group))) {
-				first_idle_cpu = 1;
+			load = target_load(i, load_idx);
+			if (load < balance_load || idle_cpu(i)) {
+				balance_load = load;
 				balance_cpu = i;
 			}
 
-			load = target_load(i, load_idx);
 		} else {
 			load = source_load(i, load_idx);
 			if (load > max_cpu_load)
@@ -6651,16 +6848,64 @@ static int nohz_test_cpu(int cpu)
 }
 #endif
 
+#ifdef CONFIG_SCHED_HMP_LITTLE_PACKING
+/*
+ * Decide if the tasks on the busy CPUs in the
+ * littlest domain would benefit from an idle balance
+ */
+static int hmp_packing_ilb_needed(int cpu, int ilb_needed)
+{
+	struct hmp_domain *hmp;
+	/* always allow ilb on non-slowest domain */
+	if (!hmp_cpu_is_slowest(cpu))
+		return ilb_needed;
+
+	hmp = hmp_cpu_domain(cpu);
+	for_each_cpu_and(cpu, &hmp->cpus, nohz.idle_cpus_mask) {
+		/* only idle balance if a CPU is loaded over threshold */
+		if (cpu_rq(cpu)->avg.load_avg_ratio > hmp_full_threshold)
+			return 1;
+	}
+	return 0;
+}
+#endif
+
+DEFINE_PER_CPU(cpumask_var_t, ilb_tmpmask);
+
 static inline int find_new_ilb(int call_cpu)
 {
 	int ilb = cpumask_first(nohz.idle_cpus_mask);
 #ifdef CONFIG_SCHED_HMP
+	int ilb_needed = 0;
+	int cpu;
+	struct cpumask* tmp = per_cpu(ilb_tmpmask, smp_processor_id());
+
 	/* restrict nohz balancing to occur in the same hmp domain */
 	ilb = cpumask_first_and(nohz.idle_cpus_mask,
 			&((struct hmp_domain *)hmp_cpu_domain(call_cpu))->cpus);
+
+	/* check to see if it's necessary within this domain */
+	cpumask_andnot(tmp,
+			&((struct hmp_domain *)hmp_cpu_domain(call_cpu))->cpus,
+			nohz.idle_cpus_mask);
+	for_each_cpu(cpu, tmp) {
+		if (cpu_rq(cpu)->nr_running > 1) {
+			ilb_needed = 1;
+			break;
+		}
+	}
+
+#ifdef CONFIG_SCHED_HMP_LITTLE_PACKING
+	if (ilb < nr_cpu_ids)
+		ilb_needed = hmp_packing_ilb_needed(ilb, ilb_needed);
 #endif
+
+	if (ilb_needed && ilb < nr_cpu_ids && idle_cpu(ilb))
+		return ilb;
+#else
 	if (ilb < nr_cpu_ids && idle_cpu(ilb))
 		return ilb;
+#endif
 
 	return nr_cpu_ids;
 }
@@ -6994,6 +7239,15 @@ static void nohz_idle_balance(int this_cpu, enum cpu_idle_type idle) { }
 #endif
 
 #ifdef CONFIG_SCHED_HMP
+
+static unsigned int hmp_task_eligible_for_up_migration(struct sched_entity *se)
+{
+	/* below hmp_up_threshold, never eligible */
+	if (se->avg.load_avg_ratio < hmp_up_threshold)
+		return 0;
+	return 1;
+}
+
 /* Check if task should migrate to a faster cpu */
 static unsigned int hmp_up_migration(int cpu, int *target_cpu, struct sched_entity *se)
 {
@@ -7017,7 +7271,7 @@ static unsigned int hmp_up_migration(int cpu, int *target_cpu, struct sched_enti
 		else
 			up_threshold = hmp_up_threshold;
 
-		if (se->avg.load_avg_ratio < up_threshold)
+		if (!hmp_task_eligible_for_up_migration(se))
 			return 0;
 	}
 
@@ -7058,8 +7312,14 @@ static unsigned int hmp_down_migration(int cpu, struct sched_entity *se)
 	struct task_struct *p = task_of(se);
 	u64 now;
 
-	if (hmp_cpu_is_slowest(cpu))
+	if (hmp_cpu_is_slowest(cpu)) {
+#ifdef CONFIG_SCHED_HMP_LITTLE_PACKING
+		if(hmp_packing_enable())
+			return 1;
+		else
+#endif
 		return 0;
+	}
 
 #ifdef CONFIG_SCHED_HMP_PRIO_FILTER
 	/* Filter by task priority */
@@ -7502,7 +7762,7 @@ static unsigned int hmp_idle_pull(int this_cpu)
 		else
 			up_threshold = hmp_up_threshold;
 
-		if (hmp_boost() || curr->avg.load_avg_ratio > up_threshold)
+		if (hmp_boost() || hmp_task_eligible_for_up_migration(curr))
 			if (curr->avg.load_avg_ratio > ratio) {
 				if (p)
 					put_task_struct(p);

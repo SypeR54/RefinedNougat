@@ -25,9 +25,14 @@
 #include <linux/reboot.h>
 #include <linux/of_gpio.h>
 
-#ifdef CONFIG_POWERSUSPEND
-#include <linux/powersuspend.h>
+#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
+#include <linux/input/doubletap2wake.h>
+extern void sensor_prox_report(unsigned int detected);
+extern void dt2w_screen_report(unsigned int detected);
 #endif
+
+
+
 
 #include <video/mipi_display.h>
 #include "../decon_display/decon_mipi_dsi.h"
@@ -89,6 +94,8 @@
 #define LDI_RDDPM_REG		0x0A
 #define LDI_BOOSTER_VAL		0x9C
 #define LDI_ESDERR_REG		0xEE
+
+#define LOGTAG "[doubletap2wakelcd]: "
 
 #ifdef SMART_DIMMING_DEBUG
 #define smtd_dbg(format, arg...)	printk(format, ##arg)
@@ -162,6 +169,7 @@ struct lcd_info {
 #ifdef CONFIG_LCD_ALPM
 	int				alpm;
 	int				current_alpm;
+	struct mutex			alpm_lock;
 #endif
 #ifdef CONFIG_LCD_HMT
 	struct dynamic_aid_param_t	hmt_daid;
@@ -467,7 +475,7 @@ static int s6e3ha2_write_set(struct lcd_info *lcd, struct lcd_seq_info *seq, u32
 			}
 		}
 		if (seq[i].sleep)
-			msleep(seq[i].sleep);
+			usleep_range(seq[i].sleep * 1000 , seq[i].sleep * 1000);
 	}
 	return ret;
 }
@@ -1131,7 +1139,10 @@ static int update_brightness(struct lcd_info *lcd, u8 force)
 		s6e3ha2_write(lcd, SEQ_GAMMA_UPDATE_L, ARRAY_SIZE(SEQ_GAMMA_UPDATE_L));
 		s6e3ha2_set_acl(lcd, force);
 		s6e3ha2_set_tset(lcd, force);
-		s6e3ha2_set_hbm(lcd, force);
+#ifdef CONFIG_LCD_ALPM
+		if (!(lcd->current_alpm && lcd->alpm))
+#endif
+			s6e3ha2_set_hbm(lcd, force);
 		s6e3ha2_write(lcd, SEQ_TEST_KEY_OFF_F0, ARRAY_SIZE(SEQ_TEST_KEY_OFF_F0));
 
 		lcd->current_bl = lcd->bl;
@@ -1255,8 +1266,7 @@ static int s6e3ha2_ldi_alpm_init(struct lcd_info *lcd)
 	s6e3ha2_write_set(lcd, SEQ_ALPM_ON_SET, ARRAY_SIZE(SEQ_ALPM_ON_SET));
 
 	/* ALPM MODE */
-	lcd->current_alpm = 1;
-
+	lcd->current_alpm = lcd->dsim->lcd_alpm = 1;
 	return ret;
 }
 
@@ -1284,36 +1294,42 @@ static int s6e3ha2_power_on(struct lcd_info *lcd)
 #endif
 
 #ifdef CONFIG_LCD_ALPM
+	mutex_lock(&lcd->alpm_lock);
 	if (lcd->current_alpm && lcd->alpm) {
-		s6e3ha2_set_partial_display(lcd);
+//		s6e3ha2_set_partial_display(lcd);
 		dev_info(&lcd->ld->dev, "%s : ALPM mode\n", __func__);
-	} else {
-		if (lcd->current_alpm) {
-			ret = s6e3ha2_ldi_alpm_exit(lcd);
-			if (ret) {
-				dev_err(&lcd->ld->dev, "failed to exit alpm.\n");
-				goto err;
-			}
+	} else if (lcd->current_alpm) {
+		ret = s6e3ha2_ldi_alpm_exit(lcd);
+		if (ret) {
+			dev_err(&lcd->ld->dev, "failed to exit alpm.\n");
+			mutex_unlock(&lcd->alpm_lock);
+			goto err;
 		}
-
+	} else {
 		ret = s6e3ha2_ldi_init(lcd);
 		if (ret) {
 			dev_err(&lcd->ld->dev, "failed to initialize ldi.\n");
+			mutex_unlock(&lcd->alpm_lock);
 			goto err;
 		}
 
 		if (lcd->alpm) {
 			ret = s6e3ha2_ldi_alpm_init(lcd);
-			if (ret)
+			if (ret) {
 				dev_err(&lcd->ld->dev, "failed to initialize alpm.\n");
+				mutex_unlock(&lcd->alpm_lock);
+				goto err;
+			}
 		} else {
 			ret = s6e3ha2_ldi_enable(lcd);
 			if (ret) {
 				dev_err(&lcd->ld->dev, "failed to enable ldi.\n");
+				mutex_unlock(&lcd->alpm_lock);
 				goto err;
 			}
 		}
 	}
+	mutex_unlock(&lcd->alpm_lock);
 #else
 	ret = s6e3ha2_ldi_init(lcd);
 	if (ret) {
@@ -1365,11 +1381,13 @@ static int s6e3ha2_power_off(struct lcd_info *lcd)
 	mutex_unlock(&lcd->bl_lock);
 
 #ifdef CONFIG_LCD_ALPM
+	mutex_lock(&lcd->alpm_lock);
 	if (lcd->current_alpm && lcd->alpm) {
 		lcd->dsim->lcd_alpm = 1;
 		dev_info(&lcd->ld->dev, "%s : ALPM mode\n", __func__);
 	} else
 		ret = s6e3ha2_ldi_disable(lcd);
+	mutex_unlock(&lcd->alpm_lock);
 #else
 	ret = s6e3ha2_ldi_disable(lcd);
 #endif
@@ -1781,26 +1799,11 @@ static ssize_t alpm_store(struct device *dev,
 {
 	struct lcd_info *lcd = dev_get_drvdata(dev);
 	int value;
-	u32 st, ed;
-	u8 *seq_cmd = SEQ_PARTIAL_AREA;
 
-	sscanf(buf, "%9d %9d %9d", &value, &st, &ed);
+	sscanf(buf, "%9d", &value);
+	dev_info(dev, "%s: %d \n", __func__, value);
 
-	dev_info(dev, "%s: %d %d, %d\n", __func__, value, st, ed);
-
-	if ((st >= lcd->height || ed >= lcd->height) || (st > ed)) {
-		pr_err("%s:Invalid Input\n", __func__);
-		return size;
-	}
-
-	lcd->partial_range[0] = st;
-	lcd->partial_range[1] = ed;
-
-	seq_cmd[1] = (st >> 8) & 0xFF;/*select msb 1byte*/
-	seq_cmd[2] = st & 0xFF;
-	seq_cmd[3] = (ed >> 8) & 0xFF;/*select msb 1byte*/
-	seq_cmd[4] = ed & 0xFF;
-
+	mutex_lock(&lcd->alpm_lock);
 	if (value) {
 		if (lcd->ldi_enable && !lcd->current_alpm)
 			s6e3ha2_ldi_alpm_init(lcd);
@@ -1810,6 +1813,7 @@ static ssize_t alpm_store(struct device *dev,
 	}
 
 	lcd->alpm = value;
+	mutex_unlock(&lcd->alpm_lock);
 
 	dev_info(dev, "%s: %d\n", __func__, lcd->alpm);
 
@@ -2392,6 +2396,9 @@ static int s6e3ha2_probe(struct mipi_dsim_device *dsim)
 
 	mutex_init(&lcd->lock);
 	mutex_init(&lcd->bl_lock);
+#ifdef CONFIG_LCD_ALPM
+	mutex_init(&lcd->alpm_lock);
+#endif
 
 	s6e3ha2_write(lcd, SEQ_TEST_KEY_ON_F0, ARRAY_SIZE(SEQ_TEST_KEY_ON_F0));
 	s6e3ha2_read_id(lcd, lcd->id);
@@ -2461,10 +2468,12 @@ static int s6e3ha2_displayon(struct mipi_dsim_device *dsim)
 	struct lcd_info *lcd = dev_get_drvdata(&dsim->lcd->dev);
 
 	s6e3ha2_power(lcd, FB_BLANK_UNBLANK);
-	
-#ifdef CONFIG_POWERSUSPEND
-	set_power_suspend_state_panel_hook(POWER_SUSPEND_INACTIVE); // Yank555.lu : add hook to handle powersuspend tasks (wakeup)
-#endif
+
+	#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
+		sensor_prox_report(0);  // LukasAddon : set  flg_sensor_prox_detecting to false if display on
+		// because some times prox sensor didnt response it state in event.
+		dt2w_screen_report(1); // LukasAddon : set dt2w event disabled
+	#endif
 
 	return 0;
 }
@@ -2475,9 +2484,10 @@ static int s6e3ha2_suspend(struct mipi_dsim_device *dsim)
 
 	s6e3ha2_power(lcd, FB_BLANK_POWERDOWN);
 	
-#ifdef CONFIG_POWERSUSPEND
-	set_power_suspend_state_panel_hook(POWER_SUSPEND_ACTIVE); // Yank555.lu : add hook to handle powersuspend tasks (sleep)
-#endif
+	#ifdef CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE
+		dt2w_screen_report(0); // LukasAddon : set dt2w event enabled
+	#endif	
+
 
 	return 0;
 }
